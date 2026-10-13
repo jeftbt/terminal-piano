@@ -444,7 +444,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Aktif tuşlar ve nota takibi: (Slot bazında o an basılan MIDI notası)
     let mut active_midi_notes: [Option<i32>; 24] = [None; 24];
-    let mut last_press_time: [Option<Instant>; 24] = Default::default();
+    let mut first_press_time: [Option<Instant>; 24] = Default::default(); // Tuşa ilk basılan an
+    let mut last_repeat_time: [Option<Instant>; 24] = Default::default(); // Son tekrar anı (fallback timeout için)
     // Tuş bırakıldığında sesin hemen kesilmeyip uzamasını sağlayan zamanlayıcı:
     let mut pending_release_notes: Vec<(i32, Instant)> = Vec::new();
     let mut received_real_release = false;
@@ -514,15 +515,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Kromatik Tuşlar
                 if let Some((slot_idx, octave)) = map_key_to_slot(key_event.code, key_event.modifiers) {
                     if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
-                        last_press_time[slot_idx] = Some(Instant::now());
+                        let now = Instant::now();
+                        last_repeat_time[slot_idx] = Some(now);
 
                         if active_midi_notes[slot_idx].is_none() {
+                            first_press_time[slot_idx] = Some(now);
                             let slot = SLOTS[slot_idx];
                             let midi_note = to_midi_note(slot.semitone, octave);
 
                             let mut s = synth.lock().unwrap();
-                            // Aynı nota hâlâ uzama süresindeyse eski zamanlayıcıyı iptal et;
-                            // yoksa süre dolunca yeni basılan notayı da keser.
+                            // Aynı nota hâlâ uzama süresindeyse eski zamanlayıcıyı iptal et
                             pending_release_notes.retain(|(n, _)| *n != midi_note);
                             // Velocity 95: Doğal, dolgun konser piyanisti tuşesi
                             s.note_on(0, midi_note, 95);
@@ -538,21 +540,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else if key_event.kind == KeyEventKind::Release {
                         received_real_release = true;
                         if let Some(midi_note) = active_midi_notes[slot_idx].take() {
-                            // Tuş bırakıldığında sesi hemen kesmek yerine, minimum uzama süresini
-                            // tamamlayana kadar bekletilecekler listesine ekliyoruz!
-                            let press_time = last_press_time[slot_idx].unwrap_or_else(Instant::now);
+                            let start_time = first_press_time[slot_idx].unwrap_or_else(Instant::now);
                             let min_duration = Duration::from_millis(min_sustain_ms as u64);
-                            let elapsed = Instant::now().duration_since(press_time);
+                            let elapsed = Instant::now().duration_since(start_time);
 
+                            // AKUSTİK DOĞRULUK:
+                            // Eğer tuş zaten min_duration'dan daha uzun süredir basılı tutulduysa,
+                            // parmak çekildiği an gerçek piyano gibi hemen susar!
+                            // Eğer hızlıca dokunup çekildiyse (staccato), kalan süre kadar uzamaya devam eder.
                             if elapsed >= min_duration {
                                 let mut s = synth.lock().unwrap();
                                 s.note_off(0, midi_note);
                             } else {
-                                let release_at = press_time + min_duration;
+                                let release_at = start_time + min_duration;
                                 pending_release_notes.push((midi_note, release_at));
                             }
 
-                            last_press_time[slot_idx] = None;
+                            first_press_time[slot_idx] = None;
+                            last_repeat_time[slot_idx] = None;
                             state_changed = true;
                         }
                     }
@@ -590,19 +595,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !received_real_release {
             let now = Instant::now();
             for idx in 0..24 {
-                if let Some(last_time) = last_press_time[idx] {
-                    if now.duration_since(last_time) > fallback_release_timeout {
+                if let Some(last_rep) = last_repeat_time[idx] {
+                    if now.duration_since(last_rep) > fallback_release_timeout {
                         if let Some(midi_note) = active_midi_notes[idx].take() {
+                            let start_time = first_press_time[idx].unwrap_or(last_rep);
                             let min_duration = Duration::from_millis(min_sustain_ms as u64);
-                            let elapsed = now.duration_since(last_time);
+                            let elapsed = now.duration_since(start_time);
                             if elapsed >= min_duration {
                                 let mut s = synth.lock().unwrap();
                                 s.note_off(0, midi_note);
                             } else {
-                                pending_release_notes.push((midi_note, last_time + min_duration));
+                                pending_release_notes.push((midi_note, start_time + min_duration));
                             }
                         }
-                        last_press_time[idx] = None;
+                        first_press_time[idx] = None;
+                        last_repeat_time[idx] = None;
                         state_changed = true;
                     }
                 }
