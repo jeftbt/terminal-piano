@@ -1,60 +1,57 @@
 # 🎹 Terminal Piano (Rust & Ratatui)
 
-A polyphonic, low-latency terminal piano synthesizer written in **Rust** using **Ratatui** and **Rodio**. Features realistic acoustic decay modeling and physical keyboard sustain pedal support.
+A polyphonic terminal piano written in **Rust**. Real sampled piano sounds via a SoundFont engine (`rustysynth`), a pixel-aligned TUI (`ratatui`), and hardware key-release detection through the Kitty keyboard protocol.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)
 
 ---
 
 ## ✨ Features
 
-- **Zero Audio Assets Required**: Pure real-time mathematical waveform synthesis (fundamental sine + acoustic harmonics).
-- **Acoustic String & Decay Dynamics**:
-  - Minimum ringing duration modeling (mimics the kinetic energy of hammer strikes on strings).
-  - Smooth damper release curve (prevents pops and clicks).
-  - Dynamic ringing duration control via arrow keys.
-- **Sustain Pedal**: Hold `Space` to keep notes ringing for ~4.5 seconds with acoustic resonance.
-- **Modern Grid TUI**: Pixel-perfect layout powered by `ratatui` with responsive rounded keys and real-time active key highlights.
-- **Hardware-Level Key Release**: Integrated with the Kitty Keyboard Protocol to detect physical key release events instantly on modern terminals.
+- **Sampled piano sound**: General MIDI acoustic grand piano from an embedded SoundFont (`TimGM6mb.sf2`), no math synthesis.
+- **2 chromatic octaves under your hands**, extended to **6 octaves** with `Shift` / `Alt`.
+- **Sustain pedal** on `Space` (MIDI CC #64).
+- **Minimum ring time**: a quick tap still rings for a configurable duration (`←` / `→`).
+- **Polyphony**: chords and two-handed playing.
+- **Single binary**: the SoundFont is compiled into the executable.
 
 ---
 
 ## 🎮 Controls
 
-### 🎼 Basic Keys (Middle Octave)
-| Key | Note | Frequency |
-|:---:|:---:|:---:|
-| `n` | **Do (C4)** | 261.6 Hz |
-| `j` | **Re (D4)** | 293.7 Hz |
-| `ı` / `i` | **Mi (E4)** | 329.6 Hz |
-| `m` | **Fa (F4)** | 349.2 Hz |
-| `k` | **Sol (G4)** | 392.0 Hz |
-| `o` | **La (A4)** | 440.0 Hz |
-| `p` | **Si (B4)** | 493.9 Hz |
+```text
+Black keys (#):     [S]   [D]         [G]   [H]   [J]          [2]   [3]         [5]   [6]   [7]
+White keys:      [Z]   [X]   [C]   [V]   [B]   [N]   [M]    [Q]   [W]   [E]   [R]   [T]   [Y]   [U]
+                 Do    Re    Mi    Fa    Sol   La    Si     Do    Re    Mi    Fa    Sol   La    Si
+                └────────────── Lower row (bass) ──────────┘ └────────────── Upper row (treble) ─────────┘
+```
 
-### 🎛️ Modifiers & Controls
-- **`Space`**: Sustain Pedal (Hold down to sustain active notes)
-- **`←` / `→`**: Decrease / Increase minimum ringing duration (100 ms – 2000 ms)
-- **`q`** or **`Esc`**: Quit application
+| Row | Normal | `Shift` | `Alt` |
+|---|---|---|---|
+| Upper (`Q…U`, `2…7`) | Octave 4 | Octave 5 | Octave 6 |
+| Lower (`Z…M`, `S…J`) | Octave 3 | Octave 2 | Octave 1 |
+
+| Key | Action |
+|---|---|
+| `Space` | Sustain pedal (hold) |
+| `←` / `→` | Minimum ring time −/+ 50 ms (100–3000 ms) |
+| `Esc` | Quit |
+
+> **Tip:** Use a terminal that supports the Kitty keyboard protocol (Kitty, WezTerm, foot, Ghostty). It gives instant key-release detection and layout-independent keys (e.g. `Shift+2` works on Turkish Q).
 
 ---
 
-## 🚀 Installation & Running
+## 🚀 Build & Run
 
-### Prerequisites
-- [Rust & Cargo](https://rustup.rs/) (1.80+)
-- ALSA / PipeWire development libraries:
-  ```bash
-  # Arch Linux
-  sudo pacman -S alsa-lib pipewire
-  # Debian/Ubuntu
-  sudo apt-get install libasound2-dev
-  # Fedora
-  sudo dnf install alsa-lib-devel
-  ```
+Prerequisites: Rust 1.85+, ALSA dev libraries.
 
-### Build and Run
+```bash
+# Arch
+sudo pacman -S alsa-lib
+# Debian/Ubuntu
+sudo apt-get install libasound2-dev
+```
+
 ```bash
 git clone https://github.com/jeftbt/terminal-piano.git
 cd terminal-piano
@@ -64,4 +61,5 @@ cargo run --release
 ---
 
 ## 📜 License
-MIT License. Created by [jeftbt](https://github.com/jeftbt).
+
+Code: MIT. SoundFont: TimGM6mb by Tim Brechbill (GPL-2.0).

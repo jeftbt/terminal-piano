@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,27 +157,31 @@ fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)
         'j' | 'J' => (10, false),
         'm' | 'M' => (11, false),
 
-        // Üst sıra
+        // Üst sıra (siyah tuşlarda Türkçe Q Shift karakterleri de yedek olarak eşlenir:
+        // Shift+2 = ' , Shift+3 = ^ , Shift+5 = % , Shift+6 = & , Shift+7 = / )
         'q' | 'Q' => (12, true),
-        '2' | '@' => (13, true),
+        '2' | '\'' => (13, true),
         'w' | 'W' => (14, true),
-        '3' | '#' => (15, true),
+        '3' | '^' => (15, true),
         'e' | 'E' => (16, true),
         'r' | 'R' => (17, true),
         '5' | '%' => (18, true),
         't' | 'T' => (19, true),
-        '6' | '^' => (20, true),
+        '6' | '&' => (20, true),
         'y' | 'Y' => (21, true),
-        '7' | '&' => (22, true),
+        '7' | '/' => (22, true),
         'u' | 'U' => (23, true),
 
         _ => return None,
     };
 
+    // Shift algılama: modifier, büyük harf veya Türkçe Q'daki Shift'li sembol
+    let shifted = has_shift || c.is_uppercase() || matches!(c, '\'' | '^' | '%' | '&' | '/');
+
     let octave = if is_upper {
         if has_alt {
             6
-        } else if has_shift || c.is_uppercase() {
+        } else if shifted {
             5
         } else {
             4
@@ -186,7 +189,7 @@ fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)
     } else {
         if has_alt {
             1
-        } else if has_shift || c.is_uppercase() {
+        } else if shifted {
             2
         } else {
             3
@@ -224,7 +227,7 @@ fn draw_ui(
             "ACOUSTIC GRAND PIANO (SoundFont Engine)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" — Gerçek Örneklenmiş Steinway Akustik Sesler", Style::default().fg(Color::DarkGray)),
+        Span::styled(" — Gerçek örneklenmiş piyano sesleri (TimGM6mb SoundFont)", Style::default().fg(Color::DarkGray)),
     ]))
     .alignment(Alignment::Center)
     .block(
@@ -404,11 +407,10 @@ fn draw_ui(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. SoundFont dosyasını yükle
-    let sf2_path = "assets/piano.sf2";
-    let mut sf2_file = File::open(sf2_path)
-        .map_err(|e| format!("SoundFont dosyası açılamadı ({}): {}", sf2_path, e))?;
-    let sound_font = Arc::new(SoundFont::new(&mut sf2_file)?);
+    // 1. SoundFont'u binary içine gömülü olarak yükle (program hangi klasörden çalışırsa çalışsın bulunur)
+    static PIANO_SF2: &[u8] = include_bytes!("../assets/piano.sf2");
+    let mut sf2_reader = std::io::Cursor::new(PIANO_SF2);
+    let sound_font = Arc::new(SoundFont::new(&mut sf2_reader)?);
 
     // 2. Synthesizer motorunu 44100 Hz stereo olarak başlat
     let sample_rate = 44100;
@@ -427,8 +429,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
 
+    // Kitty Keyboard Protocol:
+    // - REPORT_EVENT_TYPES: donanımsal tuş bırakma (Release) olayları
+    // - REPORT_ALL_KEYS_AS_ESCAPE_CODES: tuşlar klavye düzeninden bağımsız, fiziksel halleriyle gelir.
+    //   Türkçe Q'da Shift+2 → "'" yerine "2 + SHIFT" olarak gelir; ölü tuş (^) sorunu da ortadan kalkar.
     let _ = stdout.execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
     ));
 
     let backend = CrosstermBackend::new(stdout);
@@ -513,6 +521,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let midi_note = to_midi_note(slot.semitone, octave);
 
                             let mut s = synth.lock().unwrap();
+                            // Aynı nota hâlâ uzama süresindeyse eski zamanlayıcıyı iptal et;
+                            // yoksa süre dolunca yeni basılan notayı da keser.
+                            pending_release_notes.retain(|(n, _)| *n != midi_note);
                             // Velocity 95: Doğal, dolgun konser piyanisti tuşesi
                             s.note_on(0, midi_note, 95);
 
