@@ -81,7 +81,8 @@ impl Iterator for ContinuousTone {
             self.release_start_gain = self.current_gain;
         }
 
-        let base_volume = 0.38;
+        // Tekil nota seviyesini akor basıldığında taşma yapmayacak şekilde dengeliyoruz (0.18)
+        let base_volume = 0.18;
 
         if let Some(rel) = self.release_clock {
             let max_release = if self.sample_clock > min_press_samples + 5000 {
@@ -118,11 +119,17 @@ impl Iterator for ContinuousTone {
         self.sample_clock += 1;
 
         let f = self.freq;
-        let wave = (2.0 * PI * f * t).sin()
-            + 0.28 * (4.0 * PI * f * t).sin()
-            + 0.08 * (6.0 * PI * f * t).sin();
+        // Harmonikleri toplamı 1.0 olacak şekilde normalize ediyoruz
+        let wave = (0.74 * (2.0 * PI * f * t).sin())
+            + (0.20 * (4.0 * PI * f * t).sin())
+            + (0.06 * (6.0 * PI * f * t).sin());
 
-        Some(wave * amplitude)
+        let raw_sample = wave * amplitude;
+        // Soft Limiter (Yumuşak Doygunluk Filtresi):
+        // Çok sayıda tuşa ve pedala aynı anda basılsa bile cızırtı/taşma oluşmasını engeller
+        let clean_sample = (raw_sample * 1.8).tanh() * 0.85;
+
+        Some(clean_sample)
     }
 }
 
