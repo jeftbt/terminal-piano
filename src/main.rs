@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -44,9 +44,7 @@ impl ContinuousTone {
         pedal_active: Arc<AtomicBool>,
         min_press_ms: Arc<AtomicU32>,
     ) -> Self {
-        // Tuş bırakıldığında yumuşak sönümleme: 450ms
         let normal_release_samples = (sample_rate as f32 * 0.45) as usize;
-        // Pedal bırakıldığında keçelerin tellere inip sönmesi: 700ms
         let pedal_release_samples = (sample_rate as f32 * 0.70) as usize;
 
         Self {
@@ -72,13 +70,12 @@ impl Iterator for ContinuousTone {
         let key_pressed = self.is_active.load(Ordering::Relaxed);
         let pedal_held = self.pedal_active.load(Ordering::Relaxed);
 
-        // Canlı ayarlanan minimum süre (örneğin 100ms - 1500ms)
         let min_ms = self.min_press_ms.load(Ordering::Relaxed);
         let min_press_samples = (self.sample_rate as f32 * (min_ms as f32 / 1000.0)) as usize;
 
         let min_duration_reached = self.sample_clock >= min_press_samples;
 
-        // Release başladığı anda mevcut ses kazancını dondur (sıçramayı engelle)
+        // Release başladığı anda mevcut ses kazancını dondur
         if min_duration_reached && !key_pressed && !pedal_held && self.release_clock.is_none() {
             self.release_clock = Some(0);
             self.release_start_gain = self.current_gain;
@@ -101,7 +98,6 @@ impl Iterator for ContinuousTone {
             self.current_gain = self.release_start_gain * decay;
             self.release_clock = Some(rel + 1);
         } else if !key_pressed && pedal_held {
-            // Pedal basılıyken havada asılı kalma (4.5s)
             let sustain_samples = (self.sample_rate as f32 * 4.5) as usize;
             if self.sample_clock > sustain_samples {
                 return None;
@@ -109,7 +105,6 @@ impl Iterator for ContinuousTone {
             let natural_decay = (1.0 - (self.sample_clock as f32 / sustain_samples as f32)).powf(1.3);
             self.current_gain = natural_decay;
         } else {
-            // Tuş basılı tutulurken Attack (ilk 12ms)
             let attack_samples = (self.sample_rate as f32 * 0.012) as usize;
             if self.sample_clock < attack_samples {
                 self.current_gain = self.sample_clock as f32 / attack_samples as f32;
@@ -149,38 +144,128 @@ impl Source for ContinuousTone {
     }
 }
 
-struct NoteDef {
-    name: &'static str,
-    key_label: &'static str,
-    freq: f32,
+// 12 Nota için semitone ofsetleri (C = 0, C# = 1, ... B = 11)
+// C0 frekansı yaklaşık 16.3516 Hz
+fn note_frequency(semitone: u8, octave: i8) -> f32 {
+    let midi_note = (octave + 1) * 12 + semitone as i8;
+    // A4 (MIDI 69) = 440 Hz
+    440.0 * 2.0_f32.powf((midi_note as f32 - 69.0) / 12.0)
 }
 
-const NOTES: [NoteDef; 7] = [
-    NoteDef { name: "DO",  key_label: "N", freq: 261.63 },
-    NoteDef { name: "RE",  key_label: "J", freq: 293.66 },
-    NoteDef { name: "MI",  key_label: "I", freq: 329.63 },
-    NoteDef { name: "FA",  key_label: "M", freq: 349.23 },
-    NoteDef { name: "SOL", key_label: "K", freq: 392.00 },
-    NoteDef { name: "LA",  key_label: "O", freq: 440.00 },
-    NoteDef { name: "SI",  key_label: "P", freq: 493.88 },
+const NOTE_NAMES: [&str; 12] = [
+    "Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si",
 ];
 
-fn map_key_to_index(code: KeyCode) -> Option<usize> {
-    match code {
-        KeyCode::Char('n') | KeyCode::Char('N') => Some(0),
-        KeyCode::Char('j') | KeyCode::Char('J') => Some(1),
-        KeyCode::Char('ı') | KeyCode::Char('I') | KeyCode::Char('i') | KeyCode::Char('İ') => Some(2),
-        KeyCode::Char('m') | KeyCode::Char('M') => Some(3),
-        KeyCode::Char('k') | KeyCode::Char('K') => Some(4),
-        KeyCode::Char('o') | KeyCode::Char('O') => Some(5),
-        KeyCode::Char('p') | KeyCode::Char('P') => Some(6),
-        _ => None,
-    }
+/// Klavye Slotu Bilgisi
+#[derive(Clone, Copy)]
+struct KeySlot {
+    semitone: u8,       // 0..11
+    key_label: &'static str,
+    is_sharp: bool,
+}
+
+// 2 Oktavlık 24 Tuşluk Kromatik Slot Haritası
+const SLOTS: [KeySlot; 24] = [
+    // --- ALT SIRA (Oktav 3 Bazlı) ---
+    KeySlot { semitone: 0,  key_label: "Z", is_sharp: false }, // C3 (Do)
+    KeySlot { semitone: 1,  key_label: "S", is_sharp: true  }, // C#3
+    KeySlot { semitone: 2,  key_label: "X", is_sharp: false }, // D3 (Re)
+    KeySlot { semitone: 3,  key_label: "D", is_sharp: true  }, // D#3
+    KeySlot { semitone: 4,  key_label: "C", is_sharp: false }, // E3 (Mi)
+    KeySlot { semitone: 5,  key_label: "V", is_sharp: false }, // F3 (Fa)
+    KeySlot { semitone: 6,  key_label: "G", is_sharp: true  }, // F#3
+    KeySlot { semitone: 7,  key_label: "B", is_sharp: false }, // G3 (Sol)
+    KeySlot { semitone: 8,  key_label: "H", is_sharp: true  }, // G#3
+    KeySlot { semitone: 9,  key_label: "N", is_sharp: false }, // A3 (La)
+    KeySlot { semitone: 10, key_label: "J", is_sharp: true  }, // A#3
+    KeySlot { semitone: 11, key_label: "M", is_sharp: false }, // B3 (Si)
+
+    // --- ÜST SIRA (Oktav 4 Bazlı) ---
+    KeySlot { semitone: 0,  key_label: "Q", is_sharp: false }, // C4 (Do)
+    KeySlot { semitone: 1,  key_label: "2", is_sharp: true  }, // C#4
+    KeySlot { semitone: 2,  key_label: "W", is_sharp: false }, // D4 (Re)
+    KeySlot { semitone: 3,  key_label: "3", is_sharp: true  }, // D#4
+    KeySlot { semitone: 4,  key_label: "E", is_sharp: false }, // E4 (Mi)
+    KeySlot { semitone: 5,  key_label: "R", is_sharp: false }, // F4 (Fa)
+    KeySlot { semitone: 6,  key_label: "5", is_sharp: true  }, // F#4
+    KeySlot { semitone: 7,  key_label: "T", is_sharp: false }, // G4 (Sol)
+    KeySlot { semitone: 8,  key_label: "6", is_sharp: true  }, // G#4
+    KeySlot { semitone: 9,  key_label: "Y", is_sharp: false }, // A4 (La)
+    KeySlot { semitone: 10, key_label: "7", is_sharp: true  }, // A#4
+    KeySlot { semitone: 11, key_label: "U", is_sharp: false }, // B4 (Si)
+];
+
+/// Basılan tuşu (ve modifier'ı) slot indeksi ve efektif oktava eşler
+fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)> {
+    let has_shift = modifiers.contains(KeyModifiers::SHIFT);
+    let has_alt = modifiers.contains(KeyModifiers::ALT);
+
+    // Tuş karakterini yakala
+    let c = match code {
+        KeyCode::Char(ch) => ch,
+        _ => return None,
+    };
+
+    let (slot_idx, is_upper) = match c {
+        // Alt sıra beyazlar
+        'z' | 'Z' => (0, false),
+        's' | 'S' => (1, false),
+        'x' | 'X' => (2, false),
+        'd' | 'D' => (3, false),
+        'c' | 'C' => (4, false),
+        'v' | 'V' => (5, false),
+        'g' | 'G' => (6, false),
+        'b' | 'B' => (7, false),
+        'h' | 'H' => (8, false),
+        'n' | 'N' => (9, false),
+        'j' | 'J' => (10, false),
+        'm' | 'M' => (11, false),
+
+        // Üst sıra
+        'q' | 'Q' => (12, true),
+        '2' | '@' => (13, true),
+        'w' | 'W' => (14, true),
+        '3' | '#' => (15, true),
+        'e' | 'E' => (16, true),
+        'r' | 'R' => (17, true),
+        '5' | '%' => (18, true),
+        't' | 'T' => (19, true),
+        '6' | '^' => (20, true),
+        'y' | 'Y' => (21, true),
+        '7' | '&' => (22, true),
+        'u' | 'U' => (23, true),
+
+        _ => return None,
+    };
+
+    // Oktav hesaplama
+    let octave = if is_upper {
+        // Üst sıra: Baz 4. Alt: +2 (Oktav 6), Shift: +1 (Oktav 5), Normal: Oktav 4
+        if has_alt {
+            6
+        } else if has_shift || c.is_uppercase() {
+            5
+        } else {
+            4
+        }
+    } else {
+        // Alt sıra: Baz 3. Alt: -2 (Oktav 1), Shift: -1 (Oktav 2), Normal: Oktav 3
+        if has_alt {
+            1
+        } else if has_shift || c.is_uppercase() {
+            2
+        } else {
+            3
+        }
+    };
+
+    Some((slot_idx, octave))
 }
 
 fn draw_ui(
     frame: &mut ratatui::Frame,
-    active_keys: &[bool; 7],
+    active_keys: &[bool; 24],
+    last_played_info: &Option<(String, f32, i8)>,
     pedal_pressed: bool,
     min_press_ms: u32,
 ) {
@@ -190,21 +275,22 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Başlık
-            Constraint::Length(12), // Piyano Tuşları
-            Constraint::Length(3),  // Durum Çubuğu + Pedal + Süre Ayarı
-            Constraint::Length(2),  // Kısayol Bilgisi
+            Constraint::Length(7),  // Üst Sıra Piyano (Tizler)
+            Constraint::Length(7),  // Alt Sıra Piyano (Baslar)
+            Constraint::Length(3),  // Durum Çubuğu + Kontroller
+            Constraint::Length(2),  // Kısayollar
         ])
         .margin(1)
         .split(size);
 
-    // 1. Başlık Kutusu
+    // 1. Başlık
     let header = Paragraph::new(Line::from(vec![
         Span::styled("🎹 ", Style::default()),
         Span::styled(
-            "RUST TERMINAL PIANO",
+            "FULL CHROMATIC TERMINAL PIANO",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" — Dinamik Uzama & Rezonans Kontrolü", Style::default().fg(Color::DarkGray)),
+        Span::styled(" — 2 Tam Oktav + Shift/Alt Modifikatörleri (Oktav 1–6)", Style::default().fg(Color::DarkGray)),
     ]))
     .alignment(Alignment::Center)
     .block(
@@ -215,101 +301,108 @@ fn draw_ui(
     );
     frame.render_widget(header, main_layout[0]);
 
-    // 2. Piyano Tuşları
-    let piano_area = main_layout[1];
-    let key_constraints = vec![Constraint::Ratio(1, 7); 7];
-    let key_columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(key_constraints)
-        .split(piano_area);
+    // Piyano Çizim Fonksiyonu (12 Sütun)
+    let render_octave_row = |f: &mut ratatui::Frame, area: ratatui::layout::Rect, title: &str, slots_slice: &[KeySlot], active_slice: &[bool]| {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
 
-    for (i, note) in NOTES.iter().enumerate() {
-        let is_active = active_keys[i];
+        let col_constraints = vec![Constraint::Ratio(1, 12); 12];
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(inner);
 
-        let (border_color, bg_color, fg_color) = if is_active {
-            (Color::Green, Color::Green, Color::Black)
-        } else {
-            (Color::White, Color::Reset, Color::White)
-        };
+        for (i, slot) in slots_slice.iter().enumerate() {
+            let is_active = active_slice[i];
+            let note_name = NOTE_NAMES[slot.semitone as usize];
 
-        let key_text = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                note.name,
-                Style::default()
-                    .fg(fg_color)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("[ {} ]", note.key_label),
-                Style::default()
-                    .fg(if is_active { Color::Black } else { Color::Yellow })
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("{:.0}Hz", note.freq),
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(if is_active { "████" } else { "░░░░" }),
-        ];
+            let (border_col, bg_col, fg_col) = if is_active {
+                (Color::Green, Color::Green, Color::Black)
+            } else if slot.is_sharp {
+                (Color::DarkGray, Color::DarkGray, Color::White) // Siyah tuşlar
+            } else {
+                (Color::White, Color::Reset, Color::White) // Beyaz tuşlar
+            };
 
-        let key_block = Paragraph::new(key_text)
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(bg_color))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border_color)),
-            );
+            let lines = vec![
+                Line::from(Span::styled(
+                    note_name,
+                    Style::default().fg(fg_col).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("[{}]", slot.key_label),
+                    Style::default().fg(if is_active { Color::Black } else { Color::Yellow }).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(if is_active { "████" } else if slot.is_sharp { "▓▓▓▓" } else { "░░░░" }),
+            ];
 
-        frame.render_widget(key_block, key_columns[i]);
-    }
+            let key_widget = Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(bg_col))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(border_col)),
+                );
+            f.render_widget(key_widget, cols[i]);
+        }
+    };
 
-    // 3. Durum Paneli (3 Sütun: Notalar %50, Süre Ayarı %25, Pedal %25)
-    let status_area = main_layout[2];
+    // 2. Üst Sıra (Tizler: Q..U ve 2..7)
+    render_octave_row(
+        frame,
+        main_layout[1],
+        " 🎼 TİZ GRUP: [Normal: Oktav 4 (Merkez)] │ [Shift: Oktav 5 (+1)] │ [Alt: Oktav 6 (+2)] ",
+        &SLOTS[12..24],
+        &active_keys[12..24],
+    );
+
+    // 3. Alt Sıra (Baslar: Z..M ve S..J)
+    render_octave_row(
+        frame,
+        main_layout[2],
+        " 🎵 BAS GRUP: [Normal: Oktav 3 (Orta Bas)] │ [Shift: Oktav 2 (-1)] │ [Alt: Oktav 1 (-2)] ",
+        &SLOTS[0..12],
+        &active_keys[0..12],
+    );
+
+    // 4. Durum Paneli
     let status_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50), // Notalar
-            Constraint::Percentage(25), // Min Uzama Süresi
-            Constraint::Percentage(25), // Pedal Durumu
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
-        .split(status_area);
+        .split(main_layout[3]);
 
-    let active_names: Vec<String> = NOTES
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| active_keys[*i])
-        .map(|(_, n)| format!("{} ({:.1}Hz)", n.name, n.freq))
-        .collect();
-
-    let status_line = if active_names.is_empty() {
+    let status_text = if let Some((name, freq, oct)) = last_played_info {
         Line::from(vec![
-            Span::styled(" Durum: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Hazir. [← / →] ile uzama suresini degistirin.", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ▶ Son Çalınan: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}{} ", name, oct), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("({:.1} Hz)", freq), Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" ▶ Caliniyor: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                active_names.join(" + "),
-                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(" Durum: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Hazır. İki elle kromatik akor ve melodiler çalabilirsiniz.", Style::default().fg(Color::DarkGray)),
         ])
     };
 
-    let status_box = Paragraph::new(status_line).block(
+    let status_box = Paragraph::new(status_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if active_names.is_empty() { Color::DarkGray } else { Color::Green })),
+            .border_style(Style::default().fg(if last_played_info.is_some() { Color::Green } else { Color::DarkGray })),
     );
     frame.render_widget(status_box, status_cols[0]);
 
-    // Minimum Uzama Süresi Kutusu
+    // Süre Kutusu
     let time_box = Paragraph::new(Line::from(vec![
         Span::styled(" Uzama: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{} ms ", min_press_ms), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -327,7 +420,7 @@ fn draw_ui(
     // Pedal Kutusu
     let (pedal_text, pedal_bg, pedal_fg, pedal_border) = if pedal_pressed {
         (
-            " PEDAL: AKTIF ",
+            " PEDAL: AKTİF ",
             Color::Magenta,
             Color::White,
             Color::Magenta,
@@ -359,19 +452,21 @@ fn draw_ui(
     );
     frame.render_widget(pedal_box, status_cols[2]);
 
-    // 4. Alt Kısayol Bilgisi
+    // 5. Kısayol Bilgisi
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Notalar: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("N, J, I, M, K, O, P", Style::default().fg(Color::Yellow)),
-        Span::styled("  │  Uzama Ayari: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Sol/Sag Ok (← / →)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("  │  Pedal: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Pedal: ", Style::default().fg(Color::DarkGray)),
         Span::styled("SPACE", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled("  │  Cikis: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Q / ESC", Style::default().fg(Color::Red)),
+        Span::styled("  │  Uzama: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("← / →", Style::default().fg(Color::Cyan)),
+        Span::styled("  │  Tiz Oktavlar: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Shift (+1) / Alt (+2)", Style::default().fg(Color::Yellow)),
+        Span::styled("  │  Bas Oktavlar: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Shift (-1) / Alt (-2)", Style::default().fg(Color::Yellow)),
+        Span::styled("  │  Çıkış: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("ESC", Style::default().fg(Color::Red)),
     ]))
     .alignment(Alignment::Center);
-    frame.render_widget(footer, main_layout[3]);
+    frame.render_widget(footer, main_layout[4]);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -389,39 +484,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut active_flags: [Option<Arc<AtomicBool>>; 7] = Default::default();
-    let mut last_press_time: [Option<Instant>; 7] = Default::default();
+    // 24 slot için aktiflik bayrakları ve zaman takibi
+    let mut active_flags: [Option<Arc<AtomicBool>>; 24] = Default::default();
+    let mut last_press_time: [Option<Instant>; 24] = Default::default();
     let mut received_real_release = false;
 
-    // Sustain Pedal Durumu
     let pedal_atomic = Arc::new(AtomicBool::new(false));
     let mut last_space_time: Option<Instant> = None;
 
-    // Dinamik Minimum Uzama Süresi (Varsayılan 500 ms)
     let min_press_atomic = Arc::new(AtomicU32::new(500));
-
     let fallback_release_timeout = Duration::from_millis(750);
-    let mut is_active_array = [false; 7];
+    let mut is_active_array = [false; 24];
+    let mut last_played_info: Option<(String, f32, i8)> = None;
 
     loop {
         let pedal_held = pedal_atomic.load(Ordering::Relaxed);
         let current_min_ms = min_press_atomic.load(Ordering::Relaxed);
-        terminal.draw(|f| draw_ui(f, &is_active_array, pedal_held, current_min_ms))?;
+        terminal.draw(|f| draw_ui(f, &is_active_array, &last_played_info, pedal_held, current_min_ms))?;
 
         let mut state_changed = false;
 
         if event::poll(Duration::from_millis(15))? {
             let ev = event::read()?;
             if let Event::Key(key_event) = ev {
-                // Çıkış kontrolleri
-                if key_event.code == KeyCode::Char('q')
-                    || key_event.code == KeyCode::Char('Q')
-                    || key_event.code == KeyCode::Esc
-                {
+                // Çıkış (Esc tuşuyla çıkış)
+                if key_event.code == KeyCode::Esc {
                     break;
                 }
 
-                // Sol ve Sağ Ok Tuşları: Minimum Uzama Süresini Ayarla (50ms adımlarla)
+                // Sol ve Sağ Ok Tuşları: Uzama Süresi
                 if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
                     match key_event.code {
                         KeyCode::Left => {
@@ -458,32 +549,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Notalar
-                if let Some(idx) = map_key_to_index(key_event.code) {
+                // Kromatik Slot Kontrolü (24 Tuş + Shift / Alt)
+                if let Some((slot_idx, octave)) = map_key_to_slot(key_event.code, key_event.modifiers) {
                     if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
-                        last_press_time[idx] = Some(Instant::now());
+                        last_press_time[slot_idx] = Some(Instant::now());
 
-                        if active_flags[idx].is_none() {
+                        if active_flags[slot_idx].is_none() {
+                            let slot = SLOTS[slot_idx];
+                            let freq = note_frequency(slot.semitone, octave);
+
                             let flag = Arc::new(AtomicBool::new(true));
                             let source = ContinuousTone::new(
-                                NOTES[idx].freq,
+                                freq,
                                 44100,
                                 Arc::clone(&flag),
                                 Arc::clone(&pedal_atomic),
                                 Arc::clone(&min_press_atomic),
                             );
+
                             if let Ok(sink) = Sink::try_new(&stream_handle) {
                                 sink.append(source);
                                 sink.detach();
-                                active_flags[idx] = Some(flag);
+                                active_flags[slot_idx] = Some(flag);
+                                last_played_info = Some((
+                                    NOTE_NAMES[slot.semitone as usize].to_string(),
+                                    freq,
+                                    octave,
+                                ));
                                 state_changed = true;
                             }
                         }
                     } else if key_event.kind == KeyEventKind::Release {
                         received_real_release = true;
-                        if let Some(flag) = active_flags[idx].take() {
+                        if let Some(flag) = active_flags[slot_idx].take() {
                             flag.store(false, Ordering::Relaxed);
-                            last_press_time[idx] = None;
+                            last_press_time[slot_idx] = None;
                             state_changed = true;
                         }
                     }
@@ -491,7 +591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Space (Pedal) Fallback zaman aşımı kontrolü
+        // Space Fallback Timeout
         if !received_real_release && pedal_atomic.load(Ordering::Relaxed) {
             if let Some(space_time) = last_space_time {
                 if Instant::now().duration_since(space_time) > fallback_release_timeout {
@@ -502,10 +602,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Nota tuşları Fallback zaman aşımı kontrolü
+        // Slotlar Fallback Timeout
         if !received_real_release {
             let now = Instant::now();
-            for i in 0..7 {
+            for i in 0..24 {
                 if let Some(last_time) = last_press_time[i] {
                     if now.duration_since(last_time) > fallback_release_timeout {
                         if let Some(flag) = active_flags[i].take() {
@@ -519,7 +619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if state_changed {
-            for i in 0..7 {
+            for i in 0..24 {
                 is_active_array[i] = active_flags[i].is_some();
             }
         }
