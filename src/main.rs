@@ -81,13 +81,17 @@ impl Iterator for ContinuousTone {
             self.release_start_gain = self.current_gain;
         }
 
-        // Akustik Eşit Seslilik (Fletcher-Munson) Telafisi:
-        // İnsan kulağı ve hoparlörler kalın (bas) sesleri zayıf, tizleri çok sert duyar.
-        // Orta Do (261.6 Hz) referans alınarak:
-        // - Kalın bas seslerde genlik artırılır ve gövde kazandırılır
-        // - Çok tiz seslerde genlik yumuşatılır
-        let freq_weight = (261.63 / self.freq).powf(0.32).clamp(0.65, 1.85);
-        let base_volume = 0.16 * freq_weight;
+        // Güçlü Akustik Dengeleme (Agresif Bas Güçlendirme & Tiz Yumuşatma):
+        // Standart hoparlörlerde basların duyulması için logaritmik ağırlığı artırıyoruz
+        let freq_weight = if self.freq < 261.63 {
+            // Kalın sesler (Oktav 1, 2, 3): 261 Hz'den aşağı indikçe katlanarak güçlenir
+            (261.63 / self.freq).powf(0.55).clamp(1.0, 3.2)
+        } else {
+            // Tiz sesler (Oktav 4, 5, 6): Frekans arttıkça sesi ciddi oranda kısıyoruz
+            (261.63 / self.freq).powf(0.60).clamp(0.28, 1.0)
+        };
+
+        let base_volume = 0.15 * freq_weight;
 
         if let Some(rel) = self.release_clock {
             let max_release = if self.sample_clock > min_press_samples + 5000 {
@@ -124,22 +128,33 @@ impl Iterator for ContinuousTone {
         self.sample_clock += 1;
 
         let f = self.freq;
-        // Bas seslerde hoparlörden duyulabilirliği artırmak için harmonikleri dinamik ayarlıyoruz:
-        // Kalın seslerde üst harmonikler (özellikle 2. ve 3. harmonik) daha belirgin tınlar.
-        let is_bass = f < 200.0;
-        let wave = if is_bass {
+        // Bas seslerde bilgisayar hoparlörlerinin fiziksel zarını aşmak için zengin harmonik üretimi:
+        // Kalın notalarda üst harmonikler (2x, 3x, 4x) beynin bası net duymasını sağlar (psikoakustik bas)
+        let wave = if f < 130.0 {
+            // Çok derin baslar (Oktav 1 - 2)
+            0.40 * (2.0 * PI * f * t).sin()
+                + 0.32 * (4.0 * PI * f * t).sin()
+                + 0.18 * (6.0 * PI * f * t).sin()
+                + 0.10 * (8.0 * PI * f * t).sin()
+        } else if f < 280.0 {
+            // Orta baslar (Oktav 3)
             0.55 * (2.0 * PI * f * t).sin()
                 + 0.30 * (4.0 * PI * f * t).sin()
                 + 0.15 * (6.0 * PI * f * t).sin()
+        } else if f > 600.0 {
+            // Çok tizler (Oktav 5 - 6): Saf, yumuşak, kulağı acıtmayan kadifemsi ton
+            0.92 * (2.0 * PI * f * t).sin()
+                + 0.08 * (4.0 * PI * f * t).sin()
         } else {
+            // Merkez (Oktav 4)
             0.75 * (2.0 * PI * f * t).sin()
                 + 0.19 * (4.0 * PI * f * t).sin()
                 + 0.06 * (6.0 * PI * f * t).sin()
         };
 
         let raw_sample = wave * amplitude;
-        // Soft Limiter (Yumuşak Doygunluk):
-        let clean_sample = (raw_sample * 1.8).tanh() * 0.85;
+        // Soft Limiter:
+        let clean_sample = (raw_sample * 1.6).tanh() * 0.85;
 
         Some(clean_sample)
     }
