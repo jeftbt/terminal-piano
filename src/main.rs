@@ -81,8 +81,13 @@ impl Iterator for ContinuousTone {
             self.release_start_gain = self.current_gain;
         }
 
-        // Tekil nota seviyesini akor basıldığında taşma yapmayacak şekilde dengeliyoruz (0.18)
-        let base_volume = 0.18;
+        // Akustik Eşit Seslilik (Fletcher-Munson) Telafisi:
+        // İnsan kulağı ve hoparlörler kalın (bas) sesleri zayıf, tizleri çok sert duyar.
+        // Orta Do (261.6 Hz) referans alınarak:
+        // - Kalın bas seslerde genlik artırılır ve gövde kazandırılır
+        // - Çok tiz seslerde genlik yumuşatılır
+        let freq_weight = (261.63 / self.freq).powf(0.32).clamp(0.65, 1.85);
+        let base_volume = 0.16 * freq_weight;
 
         if let Some(rel) = self.release_clock {
             let max_release = if self.sample_clock > min_press_samples + 5000 {
@@ -119,14 +124,21 @@ impl Iterator for ContinuousTone {
         self.sample_clock += 1;
 
         let f = self.freq;
-        // Harmonikleri toplamı 1.0 olacak şekilde normalize ediyoruz
-        let wave = (0.74 * (2.0 * PI * f * t).sin())
-            + (0.20 * (4.0 * PI * f * t).sin())
-            + (0.06 * (6.0 * PI * f * t).sin());
+        // Bas seslerde hoparlörden duyulabilirliği artırmak için harmonikleri dinamik ayarlıyoruz:
+        // Kalın seslerde üst harmonikler (özellikle 2. ve 3. harmonik) daha belirgin tınlar.
+        let is_bass = f < 200.0;
+        let wave = if is_bass {
+            0.55 * (2.0 * PI * f * t).sin()
+                + 0.30 * (4.0 * PI * f * t).sin()
+                + 0.15 * (6.0 * PI * f * t).sin()
+        } else {
+            0.75 * (2.0 * PI * f * t).sin()
+                + 0.19 * (4.0 * PI * f * t).sin()
+                + 0.06 * (6.0 * PI * f * t).sin()
+        };
 
         let raw_sample = wave * amplitude;
-        // Soft Limiter (Yumuşak Doygunluk Filtresi):
-        // Çok sayıda tuşa ve pedala aynı anda basılsa bile cızırtı/taşma oluşmasını engeller
+        // Soft Limiter (Yumuşak Doygunluk):
         let clean_sample = (raw_sample * 1.8).tanh() * 0.85;
 
         Some(clean_sample)
