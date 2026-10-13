@@ -128,33 +128,41 @@ impl Iterator for ContinuousTone {
         self.sample_clock += 1;
 
         let f = self.freq;
-        // Bas seslerde bilgisayar hoparlörlerinin fiziksel zarını aşmak için zengin harmonik üretimi:
-        // Kalın notalarda üst harmonikler (2x, 3x, 4x) beynin bası net duymasını sağlar (psikoakustik bas)
-        let wave = if f < 130.0 {
-            // Çok derin baslar (Oktav 1 - 2)
-            0.40 * (2.0 * PI * f * t).sin()
-                + 0.32 * (4.0 * PI * f * t).sin()
-                + 0.18 * (6.0 * PI * f * t).sin()
-                + 0.10 * (8.0 * PI * f * t).sin()
+        // Akustik Piyano Teli Modellemesi:
+        // Küçük hoparlörler saf sinüs basını üretemez. Gerçek piyano telindeki
+        // zengin titreşimi (üçgen dalga + çekiç vuruntusu harmonikleri) üretiyoruz.
+        let wave = if f < 140.0 {
+            // Oktav 1 & 2 (Derin Baslar): Hoparlörün rahatça çalabileceği 6 oktavlık zengin akustik spektrum
+            let phase = (f * t).fract();
+            let acoustic_string = 2.0 * (phase - 0.5); // Canlı tel testere bileşeni
+            let sine_core = (2.0 * PI * f * t).sin();
+            let h2 = (4.0 * PI * f * t).sin();
+            let h3 = (6.0 * PI * f * t).sin();
+            let h4 = (8.0 * PI * f * t).sin();
+
+            0.20 * sine_core + 0.35 * h2 + 0.25 * h3 + 0.12 * h4 + 0.08 * acoustic_string
         } else if f < 280.0 {
-            // Orta baslar (Oktav 3)
-            0.55 * (2.0 * PI * f * t).sin()
-                + 0.30 * (4.0 * PI * f * t).sin()
-                + 0.15 * (6.0 * PI * f * t).sin()
+            // Oktav 3 (Orta Baslar - Z...M grubu): Tok, akustik, net piyano gövdesi
+            let sine_core = (2.0 * PI * f * t).sin();
+            let h2 = (4.0 * PI * f * t).sin();
+            let h3 = (6.0 * PI * f * t).sin();
+            let h4 = (8.0 * PI * f * t).sin();
+
+            0.35 * sine_core + 0.35 * h2 + 0.20 * h3 + 0.10 * h4
         } else if f > 600.0 {
-            // Çok tizler (Oktav 5 - 6): Saf, yumuşak, kulağı acıtmayan kadifemsi ton
-            0.92 * (2.0 * PI * f * t).sin()
-                + 0.08 * (4.0 * PI * f * t).sin()
+            // Oktav 5 & 6 (Tizler): Saf, dinlendirici, yumuşak ton
+            0.94 * (2.0 * PI * f * t).sin()
+                + 0.06 * (4.0 * PI * f * t).sin()
         } else {
-            // Merkez (Oktav 4)
-            0.75 * (2.0 * PI * f * t).sin()
-                + 0.19 * (4.0 * PI * f * t).sin()
-                + 0.06 * (6.0 * PI * f * t).sin()
+            // Oktav 4 (Merkez Piyano - Q...U grubu)
+            0.70 * (2.0 * PI * f * t).sin()
+                + 0.22 * (4.0 * PI * f * t).sin()
+                + 0.08 * (6.0 * PI * f * t).sin()
         };
 
         let raw_sample = wave * amplitude;
         // Soft Limiter:
-        let clean_sample = (raw_sample * 1.6).tanh() * 0.85;
+        let clean_sample = (raw_sample * 1.5).tanh() * 0.90;
 
         Some(clean_sample)
     }
