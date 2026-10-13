@@ -1,7 +1,7 @@
-use std::f32::consts::PI;
+use std::fs::File;
 use std::io::stdout;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -20,161 +20,61 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Terminal;
 use rodio::source::Source;
 use rodio::{OutputStream, Sink};
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
-/// Akustik piyano titreşim ve sönüm dinamiklerine sahip ses kaynağı
-struct ContinuousTone {
-    freq: f32,
+/// RustySynth SoundFont tabanlı gerçek zamanlı stereo ses kaynağı
+struct SoundFontSource {
+    synth: Arc<Mutex<Synthesizer>>,
     sample_rate: u32,
-    sample_clock: usize,
-    is_active: Arc<AtomicBool>,
-    pedal_active: Arc<AtomicBool>,
-    min_press_ms: Arc<AtomicU32>,
-    release_clock: Option<usize>,
-    normal_release_samples: usize,
-    pedal_release_samples: usize,
-    release_start_gain: f32,
-    current_gain: f32,
+    buffer_left: Vec<f32>,
+    buffer_right: Vec<f32>,
+    buffer_pos: usize,
 }
 
-impl ContinuousTone {
-    fn new(
-        freq: f32,
-        sample_rate: u32,
-        is_active: Arc<AtomicBool>,
-        pedal_active: Arc<AtomicBool>,
-        min_press_ms: Arc<AtomicU32>,
-    ) -> Self {
-        let normal_release_samples = (sample_rate as f32 * 0.45) as usize;
-        let pedal_release_samples = (sample_rate as f32 * 0.70) as usize;
-
+impl SoundFontSource {
+    fn new(synth: Arc<Mutex<Synthesizer>>, sample_rate: u32) -> Self {
         Self {
-            freq,
+            synth,
             sample_rate,
-            sample_clock: 0,
-            is_active,
-            pedal_active,
-            min_press_ms,
-            release_clock: None,
-            normal_release_samples,
-            pedal_release_samples,
-            release_start_gain: 1.0,
-            current_gain: 1.0,
+            buffer_left: vec![0.0; 128],
+            buffer_right: vec![0.0; 128],
+            buffer_pos: 256, // başlangıçta boş kabul et
         }
     }
 }
 
-impl Iterator for ContinuousTone {
+impl Iterator for SoundFontSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let key_pressed = self.is_active.load(Ordering::Relaxed);
-        let pedal_held = self.pedal_active.load(Ordering::Relaxed);
-
-        let min_ms = self.min_press_ms.load(Ordering::Relaxed);
-        let min_press_samples = (self.sample_rate as f32 * (min_ms as f32 / 1000.0)) as usize;
-
-        let min_duration_reached = self.sample_clock >= min_press_samples;
-
-        // Release başladığı anda mevcut ses kazancını dondur
-        if min_duration_reached && !key_pressed && !pedal_held && self.release_clock.is_none() {
-            self.release_clock = Some(0);
-            self.release_start_gain = self.current_gain;
+        // İki kanallı interleave (L, R, L, R...) akış
+        if self.buffer_pos >= self.buffer_left.len() * 2 {
+            let mut synth = self.synth.lock().unwrap();
+            synth.render(&mut self.buffer_left[..], &mut self.buffer_right[..]);
+            self.buffer_pos = 0;
         }
 
-        // Güçlü Akustik Dengeleme (Agresif Bas Güçlendirme & Tiz Yumuşatma):
-        // Standart hoparlörlerde basların duyulması için logaritmik ağırlığı artırıyoruz
-        let freq_weight = if self.freq < 261.63 {
-            // Kalın sesler (Oktav 1, 2, 3): 261 Hz'den aşağı indikçe katlanarak güçlenir
-            (261.63 / self.freq).powf(0.55).clamp(1.0, 3.2)
+        let frame_index = self.buffer_pos / 2;
+        let is_left = (self.buffer_pos % 2) == 0;
+        self.buffer_pos += 1;
+
+        let sample = if is_left {
+            self.buffer_left[frame_index]
         } else {
-            // Tiz sesler (Oktav 4, 5, 6): Frekans arttıkça sesi ciddi oranda kısıyoruz
-            (261.63 / self.freq).powf(0.60).clamp(0.28, 1.0)
+            self.buffer_right[frame_index]
         };
 
-        let base_volume = 0.15 * freq_weight;
-
-        if let Some(rel) = self.release_clock {
-            let max_release = if self.sample_clock > min_press_samples + 5000 {
-                self.pedal_release_samples
-            } else {
-                self.normal_release_samples
-            };
-
-            if rel >= max_release {
-                return None;
-            }
-            let progress = rel as f32 / max_release as f32;
-            let decay = (1.0 - progress).powi(2);
-            self.current_gain = self.release_start_gain * decay;
-            self.release_clock = Some(rel + 1);
-        } else if !key_pressed && pedal_held {
-            let sustain_samples = (self.sample_rate as f32 * 4.5) as usize;
-            if self.sample_clock > sustain_samples {
-                return None;
-            }
-            let natural_decay = (1.0 - (self.sample_clock as f32 / sustain_samples as f32)).powf(1.3);
-            self.current_gain = natural_decay;
-        } else {
-            let attack_samples = (self.sample_rate as f32 * 0.012) as usize;
-            if self.sample_clock < attack_samples {
-                self.current_gain = self.sample_clock as f32 / attack_samples as f32;
-            } else {
-                self.current_gain = 1.0;
-            }
-        }
-
-        let amplitude = base_volume * self.current_gain;
-        let t = self.sample_clock as f32 / self.sample_rate as f32;
-        self.sample_clock += 1;
-
-        let f = self.freq;
-        // Akustik Piyano Teli Modellemesi:
-        // Küçük hoparlörler saf sinüs basını üretemez. Gerçek piyano telindeki
-        // zengin titreşimi (üçgen dalga + çekiç vuruntusu harmonikleri) üretiyoruz.
-        let wave = if f < 140.0 {
-            // Oktav 1 & 2 (Derin Baslar): Hoparlörün rahatça çalabileceği 6 oktavlık zengin akustik spektrum
-            let phase = (f * t).fract();
-            let acoustic_string = 2.0 * (phase - 0.5); // Canlı tel testere bileşeni
-            let sine_core = (2.0 * PI * f * t).sin();
-            let h2 = (4.0 * PI * f * t).sin();
-            let h3 = (6.0 * PI * f * t).sin();
-            let h4 = (8.0 * PI * f * t).sin();
-
-            0.20 * sine_core + 0.35 * h2 + 0.25 * h3 + 0.12 * h4 + 0.08 * acoustic_string
-        } else if f < 280.0 {
-            // Oktav 3 (Orta Baslar - Z...M grubu): Tok, akustik, net piyano gövdesi
-            let sine_core = (2.0 * PI * f * t).sin();
-            let h2 = (4.0 * PI * f * t).sin();
-            let h3 = (6.0 * PI * f * t).sin();
-            let h4 = (8.0 * PI * f * t).sin();
-
-            0.35 * sine_core + 0.35 * h2 + 0.20 * h3 + 0.10 * h4
-        } else if f > 600.0 {
-            // Oktav 5 & 6 (Tizler): Saf, dinlendirici, yumuşak ton
-            0.94 * (2.0 * PI * f * t).sin()
-                + 0.06 * (4.0 * PI * f * t).sin()
-        } else {
-            // Oktav 4 (Merkez Piyano - Q...U grubu)
-            0.70 * (2.0 * PI * f * t).sin()
-                + 0.22 * (4.0 * PI * f * t).sin()
-                + 0.08 * (6.0 * PI * f * t).sin()
-        };
-
-        let raw_sample = wave * amplitude;
-        // Soft Limiter:
-        let clean_sample = (raw_sample * 1.5).tanh() * 0.90;
-
-        Some(clean_sample)
+        Some(sample)
     }
 }
 
-impl Source for ContinuousTone {
+impl Source for SoundFontSource {
     fn current_frame_len(&self) -> Option<usize> {
         None
     }
 
     fn channels(&self) -> u16 {
-        1
+        2 // Gerçek Stereo
     }
 
     fn sample_rate(&self) -> u32 {
@@ -186,22 +86,19 @@ impl Source for ContinuousTone {
     }
 }
 
-// 12 Nota için semitone ofsetleri (C = 0, C# = 1, ... B = 11)
-// C0 frekansı yaklaşık 16.3516 Hz
-fn note_frequency(semitone: u8, octave: i8) -> f32 {
-    let midi_note = (octave + 1) * 12 + semitone as i8;
-    // A4 (MIDI 69) = 440 Hz
-    440.0 * 2.0_f32.powf((midi_note as f32 - 69.0) / 12.0)
-}
-
 const NOTE_NAMES: [&str; 12] = [
     "Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si",
 ];
 
-/// Klavye Slotu Bilgisi
+// Semitone (0..11) ve Oktavdan MIDI nota numarası:
+// C4 (Orta Do) = 60
+fn to_midi_note(semitone: u8, octave: i8) -> i32 {
+    ((octave + 1) * 12 + semitone as i8) as i32
+}
+
 #[derive(Clone, Copy)]
 struct KeySlot {
-    semitone: u8,       // 0..11
+    semitone: u8, // 0..11
     key_label: &'static str,
     is_sharp: bool,
 }
@@ -237,19 +134,17 @@ const SLOTS: [KeySlot; 24] = [
     KeySlot { semitone: 11, key_label: "U", is_sharp: false }, // B4 (Si)
 ];
 
-/// Basılan tuşu (ve modifier'ı) slot indeksi ve efektif oktava eşler
 fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)> {
     let has_shift = modifiers.contains(KeyModifiers::SHIFT);
     let has_alt = modifiers.contains(KeyModifiers::ALT);
 
-    // Tuş karakterini yakala
     let c = match code {
         KeyCode::Char(ch) => ch,
         _ => return None,
     };
 
     let (slot_idx, is_upper) = match c {
-        // Alt sıra beyazlar
+        // Alt sıra
         'z' | 'Z' => (0, false),
         's' | 'S' => (1, false),
         'x' | 'X' => (2, false),
@@ -280,9 +175,7 @@ fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)
         _ => return None,
     };
 
-    // Oktav hesaplama
     let octave = if is_upper {
-        // Üst sıra: Baz 4. Alt: +2 (Oktav 6), Shift: +1 (Oktav 5), Normal: Oktav 4
         if has_alt {
             6
         } else if has_shift || c.is_uppercase() {
@@ -291,7 +184,6 @@ fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)
             4
         }
     } else {
-        // Alt sıra: Baz 3. Alt: -2 (Oktav 1), Shift: -1 (Oktav 2), Normal: Oktav 3
         if has_alt {
             1
         } else if has_shift || c.is_uppercase() {
@@ -307,9 +199,8 @@ fn map_key_to_slot(code: KeyCode, modifiers: KeyModifiers) -> Option<(usize, i8)
 fn draw_ui(
     frame: &mut ratatui::Frame,
     active_keys: &[bool; 24],
-    last_played_info: &Option<(String, f32, i8)>,
+    last_played_info: &Option<(String, i8, i32)>,
     pedal_pressed: bool,
-    min_press_ms: u32,
 ) {
     let size = frame.area();
 
@@ -319,7 +210,7 @@ fn draw_ui(
             Constraint::Length(3),  // Başlık
             Constraint::Length(7),  // Üst Sıra Piyano (Tizler)
             Constraint::Length(7),  // Alt Sıra Piyano (Baslar)
-            Constraint::Length(3),  // Durum Çubuğu + Kontroller
+            Constraint::Length(3),  // Durum Çubuğu
             Constraint::Length(2),  // Kısayollar
         ])
         .margin(1)
@@ -329,10 +220,10 @@ fn draw_ui(
     let header = Paragraph::new(Line::from(vec![
         Span::styled("🎹 ", Style::default()),
         Span::styled(
-            "FULL CHROMATIC TERMINAL PIANO",
+            "ACOUSTIC GRAND PIANO (SoundFont Engine)",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" — 2 Tam Oktav + Shift/Alt Modifikatörleri (Oktav 1–6)", Style::default().fg(Color::DarkGray)),
+        Span::styled(" — Gerçek Örneklenmiş Steinway Akustik Sesler", Style::default().fg(Color::DarkGray)),
     ]))
     .alignment(Alignment::Center)
     .block(
@@ -343,7 +234,7 @@ fn draw_ui(
     );
     frame.render_widget(header, main_layout[0]);
 
-    // Piyano Çizim Fonksiyonu (12 Sütun)
+    // Piyano Tuş Çizimi
     let render_octave_row = |f: &mut ratatui::Frame, area: ratatui::layout::Rect, title: &str, slots_slice: &[KeySlot], active_slice: &[bool]| {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -365,9 +256,9 @@ fn draw_ui(
             let (border_col, bg_col, fg_col) = if is_active {
                 (Color::Green, Color::Green, Color::Black)
             } else if slot.is_sharp {
-                (Color::DarkGray, Color::DarkGray, Color::White) // Siyah tuşlar
+                (Color::DarkGray, Color::DarkGray, Color::White)
             } else {
-                (Color::White, Color::Reset, Color::White) // Beyaz tuşlar
+                (Color::White, Color::Reset, Color::White)
             };
 
             let lines = vec![
@@ -395,7 +286,7 @@ fn draw_ui(
         }
     };
 
-    // 2. Üst Sıra (Tizler: Q..U ve 2..7)
+    // 2. Üst Sıra
     render_octave_row(
         frame,
         main_layout[1],
@@ -404,7 +295,7 @@ fn draw_ui(
         &active_keys[12..24],
     );
 
-    // 3. Alt Sıra (Baslar: Z..M ve S..J)
+    // 3. Alt Sıra
     render_octave_row(
         frame,
         main_layout[2],
@@ -417,22 +308,21 @@ fn draw_ui(
     let status_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
+            Constraint::Percentage(70),
+            Constraint::Percentage(30),
         ])
         .split(main_layout[3]);
 
-    let status_text = if let Some((name, freq, oct)) = last_played_info {
+    let status_text = if let Some((name, oct, midi)) = last_played_info {
         Line::from(vec![
-            Span::styled(" ▶ Son Çalınan: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" ▶ Çalınan Nota: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{}{} ", name, oct), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({:.1} Hz)", freq), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("(MIDI Note #{})", midi), Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
             Span::styled(" Durum: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Hazır. İki elle kromatik akor ve melodiler çalabilirsiniz.", Style::default().fg(Color::DarkGray)),
+            Span::styled("Gerçek Akustik Piyano hazır. Tuşlara basarak çalabilirsiniz.", Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -444,25 +334,10 @@ fn draw_ui(
     );
     frame.render_widget(status_box, status_cols[0]);
 
-    // Süre Kutusu
-    let time_box = Paragraph::new(Line::from(vec![
-        Span::styled(" Uzama: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{} ms ", min_press_ms), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("[←/→]", Style::default().fg(Color::Yellow)),
-    ]))
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-    frame.render_widget(time_box, status_cols[1]);
-
     // Pedal Kutusu
     let (pedal_text, pedal_bg, pedal_fg, pedal_border) = if pedal_pressed {
         (
-            " PEDAL: AKTİF ",
+            " PEDAL: AKTİF (SUSTAIN) ",
             Color::Magenta,
             Color::White,
             Color::Magenta,
@@ -492,17 +367,15 @@ fn draw_ui(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(pedal_border)),
     );
-    frame.render_widget(pedal_box, status_cols[2]);
+    frame.render_widget(pedal_box, status_cols[1]);
 
     // 5. Kısayol Bilgisi
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("Pedal: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("SPACE", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled("  │  Uzama: ", Style::default().fg(Color::DarkGray)),
-        Span::styled("← / →", Style::default().fg(Color::Cyan)),
-        Span::styled("  │  Tiz Oktavlar: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("SPACE (Basılı Tut)", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("  │  Tizler: ", Style::default().fg(Color::DarkGray)),
         Span::styled("Shift (+1) / Alt (+2)", Style::default().fg(Color::Yellow)),
-        Span::styled("  │  Bas Oktavlar: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  Baslar: ", Style::default().fg(Color::DarkGray)),
         Span::styled("Shift (-1) / Alt (-2)", Style::default().fg(Color::Yellow)),
         Span::styled("  │  Çıkış: ", Style::default().fg(Color::DarkGray)),
         Span::styled("ESC", Style::default().fg(Color::Red)),
@@ -512,9 +385,25 @@ fn draw_ui(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (_stream, stream_handle) = OutputStream::try_default()?;
-    let stream_handle = Arc::new(stream_handle);
+    // 1. SoundFont dosyasını yükle
+    let sf2_path = "assets/piano.sf2";
+    let mut sf2_file = File::open(sf2_path)
+        .map_err(|e| format!("SoundFont dosyası açılamadı ({}): {}", sf2_path, e))?;
+    let sound_font = Arc::new(SoundFont::new(&mut sf2_file)?);
 
+    // 2. Synthesizer motorunu 44100 Hz stereo olarak başlat
+    let sample_rate = 44100;
+    let settings = SynthesizerSettings::new(sample_rate as i32);
+    let synth = Arc::new(Mutex::new(Synthesizer::new(&sound_font, &settings)?));
+
+    // 3. Rodio ses akışına bağla
+    let (_stream, stream_handle) = OutputStream::try_default()?;
+    let sink = Sink::try_new(&stream_handle)?;
+    let source = SoundFontSource::new(Arc::clone(&synth), sample_rate);
+    sink.append(source);
+    sink.play();
+
+    // 4. Terminal TUI Kurulumu
     enable_raw_mode()?;
     let mut stdout = stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -526,105 +415,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 24 slot için aktiflik bayrakları ve zaman takibi
-    let mut active_flags: [Option<Arc<AtomicBool>>; 24] = Default::default();
+    // Aktif tuşlar ve nota takibi: (Slot bazında o an basılan MIDI notası)
+    let mut active_midi_notes: [Option<i32>; 24] = [None; 24];
     let mut last_press_time: [Option<Instant>; 24] = Default::default();
     let mut received_real_release = false;
 
     let pedal_atomic = Arc::new(AtomicBool::new(false));
     let mut last_space_time: Option<Instant> = None;
-
-    let min_press_atomic = Arc::new(AtomicU32::new(500));
     let fallback_release_timeout = Duration::from_millis(750);
+
     let mut is_active_array = [false; 24];
-    let mut last_played_info: Option<(String, f32, i8)> = None;
+    let mut last_played_info: Option<(String, i8, i32)> = None;
 
     loop {
         let pedal_held = pedal_atomic.load(Ordering::Relaxed);
-        let current_min_ms = min_press_atomic.load(Ordering::Relaxed);
-        terminal.draw(|f| draw_ui(f, &is_active_array, &last_played_info, pedal_held, current_min_ms))?;
+        terminal.draw(|f| draw_ui(f, &is_active_array, &last_played_info, pedal_held))?;
 
         let mut state_changed = false;
 
         if event::poll(Duration::from_millis(15))? {
             let ev = event::read()?;
             if let Event::Key(key_event) = ev {
-                // Çıkış (Esc tuşuyla çıkış)
                 if key_event.code == KeyCode::Esc {
                     break;
                 }
 
-                // Sol ve Sağ Ok Tuşları: Uzama Süresi
-                if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
-                    match key_event.code {
-                        KeyCode::Left => {
-                            let current = min_press_atomic.load(Ordering::Relaxed);
-                            if current > 100 {
-                                min_press_atomic.store(current - 50, Ordering::Relaxed);
-                                state_changed = true;
-                            }
-                        }
-                        KeyCode::Right => {
-                            let current = min_press_atomic.load(Ordering::Relaxed);
-                            if current < 2000 {
-                                min_press_atomic.store(current + 50, Ordering::Relaxed);
-                                state_changed = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                // SPACE -> Sustain Pedalı
+                // SPACE -> Sustain Pedalı (MIDI Controller #64)
                 if key_event.code == KeyCode::Char(' ') {
                     if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
                         last_space_time = Some(Instant::now());
                         if !pedal_atomic.load(Ordering::Relaxed) {
                             pedal_atomic.store(true, Ordering::Relaxed);
+                            let mut s = synth.lock().unwrap();
+                            s.process_midi_message(0, 0xB0, 64, 127); // Hold Pedal ON
                             state_changed = true;
                         }
                     } else if key_event.kind == KeyEventKind::Release {
                         received_real_release = true;
                         pedal_atomic.store(false, Ordering::Relaxed);
+                        let mut s = synth.lock().unwrap();
+                        s.process_midi_message(0, 0xB0, 64, 0); // Hold Pedal OFF
                         last_space_time = None;
                         state_changed = true;
                     }
                 }
 
-                // Kromatik Slot Kontrolü (24 Tuş + Shift / Alt)
+                // Kromatik Tuşlar
                 if let Some((slot_idx, octave)) = map_key_to_slot(key_event.code, key_event.modifiers) {
                     if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
                         last_press_time[slot_idx] = Some(Instant::now());
 
-                        if active_flags[slot_idx].is_none() {
+                        if active_midi_notes[slot_idx].is_none() {
                             let slot = SLOTS[slot_idx];
-                            let freq = note_frequency(slot.semitone, octave);
+                            let midi_note = to_midi_note(slot.semitone, octave);
 
-                            let flag = Arc::new(AtomicBool::new(true));
-                            let source = ContinuousTone::new(
-                                freq,
-                                44100,
-                                Arc::clone(&flag),
-                                Arc::clone(&pedal_atomic),
-                                Arc::clone(&min_press_atomic),
-                            );
+                            let mut s = synth.lock().unwrap();
+                            // Velocity 95: Doğal, dolgun konser piyanisti tuşesi
+                            s.note_on(0, midi_note, 95);
 
-                            if let Ok(sink) = Sink::try_new(&stream_handle) {
-                                sink.append(source);
-                                sink.detach();
-                                active_flags[slot_idx] = Some(flag);
-                                last_played_info = Some((
-                                    NOTE_NAMES[slot.semitone as usize].to_string(),
-                                    freq,
-                                    octave,
-                                ));
-                                state_changed = true;
-                            }
+                            active_midi_notes[slot_idx] = Some(midi_note);
+                            last_played_info = Some((
+                                NOTE_NAMES[slot.semitone as usize].to_string(),
+                                octave,
+                                midi_note,
+                            ));
+                            state_changed = true;
                         }
                     } else if key_event.kind == KeyEventKind::Release {
                         received_real_release = true;
-                        if let Some(flag) = active_flags[slot_idx].take() {
-                            flag.store(false, Ordering::Relaxed);
+                        if let Some(midi_note) = active_midi_notes[slot_idx].take() {
+                            let mut s = synth.lock().unwrap();
+                            s.note_off(0, midi_note);
                             last_press_time[slot_idx] = None;
                             state_changed = true;
                         }
@@ -638,20 +499,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(space_time) = last_space_time {
                 if Instant::now().duration_since(space_time) > fallback_release_timeout {
                     pedal_atomic.store(false, Ordering::Relaxed);
+                    let mut s = synth.lock().unwrap();
+                    s.process_midi_message(0, 0xB0, 64, 0);
                     last_space_time = None;
                     state_changed = true;
                 }
             }
         }
 
-        // Slotlar Fallback Timeout
+        // Tuşlar Fallback Timeout
         if !received_real_release {
             let now = Instant::now();
             for i in 0..24 {
                 if let Some(last_time) = last_press_time[i] {
                     if now.duration_since(last_time) > fallback_release_timeout {
-                        if let Some(flag) = active_flags[i].take() {
-                            flag.store(false, Ordering::Relaxed);
+                        if let Some(midi_note) = active_midi_notes[i].take() {
+                            let mut s = synth.lock().unwrap();
+                            s.note_off(0, midi_note);
                         }
                         last_press_time[i] = None;
                         state_changed = true;
@@ -662,7 +526,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if state_changed {
             for i in 0..24 {
-                is_active_array[i] = active_flags[i].is_some();
+                is_active_array[i] = active_midi_notes[i].is_some();
             }
         }
     }
