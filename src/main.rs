@@ -73,8 +73,12 @@ struct KeySlot {
     key_code: egui::Key,
 }
 
-const NOTE_NAMES: [&str; 12] = [
+const NOTE_NAMES_LETTERS: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+const NOTE_NAMES_SOLFEGE: [&str; 12] = [
+    "Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si",
 ];
 
 // 24 Tuşluk Slot Listesi
@@ -136,6 +140,7 @@ struct PianoApp {
     min_sustain_ms: u32,
     velocity: i32,
     base_octave: i8, // Varsayılan 3 (yani 3 ve 4). Tab ile 1, 2, 3, 4, 5 arasında döner.
+    use_letter_notation: bool, // true: A-B-C-D-E-F-G (Harf) modu, false: Do-Re-Mi modu
 
     last_played_info: Option<(String, i8, i32)>,
     mouse_active_slot: Option<usize>,
@@ -168,8 +173,18 @@ impl PianoApp {
             min_sustain_ms: 550,
             velocity: 95,
             base_octave: 3,
+            use_letter_notation: true, // Varsayılan A B C D E F G
             last_played_info: None,
             mouse_active_slot: None,
+        }
+    }
+
+    fn note_name(&self, semitone: i8) -> &'static str {
+        let idx = (semitone as usize) % 12;
+        if self.use_letter_notation {
+            NOTE_NAMES_LETTERS[idx]
+        } else {
+            NOTE_NAMES_SOLFEGE[idx]
         }
     }
 
@@ -187,7 +202,7 @@ impl PianoApp {
 
             self.active_midi_notes[slot_idx] = Some(midi_note);
             self.last_played_info = Some((
-                NOTE_NAMES[slot.semitone as usize].to_string(),
+                self.note_name(slot.semitone).to_string(),
                 octave,
                 midi_note,
             ));
@@ -353,7 +368,7 @@ impl PianoApp {
             painter.text(
                 Pos2::new(key_rect.center().x, key_rect.bottom() - 44.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{}{}", NOTE_NAMES[semi as usize], oct),
+                format!("{}{}", self.note_name(semi), oct),
                 egui::FontId::proportional(15.0),
                 note_color,
             );
@@ -432,7 +447,7 @@ impl PianoApp {
             painter.text(
                 Pos2::new(key_rect.center().x, key_rect.bottom() - 32.0),
                 egui::Align2::CENTER_CENTER,
-                NOTE_NAMES[semi as usize],
+                self.note_name(semi),
                 egui::FontId::proportional(12.0),
                 if is_active { Color32::WHITE } else { Color32::from_rgb(230, 230, 235) },
             );
@@ -628,6 +643,18 @@ impl eframe::App for PianoApp {
                     let text = format!("OKTAV: {} & {} [TAB]", self.base_octave, self.base_octave + 1);
                     ui.label(egui::RichText::new(text).size(11.0).strong().color(Color32::from_rgb(215, 220, 235)));
                 });
+
+                ui.add_space(4.0);
+
+                // Nota Modu Butonu (A-B-C vs Do-Re-Mi)
+                let mode_label = if self.use_letter_notation {
+                    "MOD: A-B-C-D-E-F-G"
+                } else {
+                    "MOD: Do-Re-Mi-Fa-Sol"
+                };
+                if ui.button(egui::RichText::new(mode_label).size(11.0).strong().color(Color32::from_rgb(113, 112, 255))).clicked() {
+                    self.use_letter_notation = !self.use_letter_notation;
+                }
             });
         });
 
