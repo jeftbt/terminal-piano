@@ -201,6 +201,7 @@ fn draw_ui(
     active_keys: &[bool; 24],
     last_played_info: &Option<(String, i8, i32)>,
     pedal_pressed: bool,
+    min_sustain_ms: u32,
 ) {
     let size = frame.area();
 
@@ -304,25 +305,26 @@ fn draw_ui(
         &active_keys[0..12],
     );
 
-    // 4. Durum Paneli
+    // 4. Durum Paneli (3 Sütun: Notalar %50, Uzama %25, Pedal %25)
     let status_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(70),
-            Constraint::Percentage(30),
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ])
         .split(main_layout[3]);
 
     let status_text = if let Some((name, oct, midi)) = last_played_info {
         Line::from(vec![
-            Span::styled(" ▶ Çalınan Nota: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" ▶ Çalınan: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{}{} ", name, oct), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("(MIDI Note #{})", midi), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("(#{})", midi), Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
             Span::styled(" Durum: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Gerçek Akustik Piyano hazır. Tuşlara basarak çalabilirsiniz.", Style::default().fg(Color::DarkGray)),
+            Span::styled("Gerçek Akustik Piyano hazır. [←/→] ile uzama süresini ayarlayın.", Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -334,10 +336,25 @@ fn draw_ui(
     );
     frame.render_widget(status_box, status_cols[0]);
 
+    // Minimum Uzama Kutusu
+    let time_box = Paragraph::new(Line::from(vec![
+        Span::styled(" Uzama: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} ms ", min_sustain_ms), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("[←/→]", Style::default().fg(Color::Yellow)),
+    ]))
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(time_box, status_cols[1]);
+
     // Pedal Kutusu
     let (pedal_text, pedal_bg, pedal_fg, pedal_border) = if pedal_pressed {
         (
-            " PEDAL: AKTİF (SUSTAIN) ",
+            " PEDAL: AKTİF ",
             Color::Magenta,
             Color::White,
             Color::Magenta,
@@ -367,12 +384,14 @@ fn draw_ui(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(pedal_border)),
     );
-    frame.render_widget(pedal_box, status_cols[1]);
+    frame.render_widget(pedal_box, status_cols[2]);
 
     // 5. Kısayol Bilgisi
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("Pedal: ", Style::default().fg(Color::DarkGray)),
         Span::styled("SPACE (Basılı Tut)", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("  │  Uzama Ayarı: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("← / →", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled("  │  Tizler: ", Style::default().fg(Color::DarkGray)),
         Span::styled("Shift (+1) / Alt (+2)", Style::default().fg(Color::Yellow)),
         Span::styled("  │  Baslar: ", Style::default().fg(Color::DarkGray)),
@@ -418,18 +437,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Aktif tuşlar ve nota takibi: (Slot bazında o an basılan MIDI notası)
     let mut active_midi_notes: [Option<i32>; 24] = [None; 24];
     let mut last_press_time: [Option<Instant>; 24] = Default::default();
+    // Tuş bırakıldığında sesin hemen kesilmeyip uzamasını sağlayan zamanlayıcı:
+    let mut pending_release_notes: Vec<(i32, Instant)> = Vec::new();
     let mut received_real_release = false;
 
     let pedal_atomic = Arc::new(AtomicBool::new(false));
     let mut last_space_time: Option<Instant> = None;
     let fallback_release_timeout = Duration::from_millis(750);
 
+    // Minimum uzama süresi (varsayılan 550 ms)
+    let mut min_sustain_ms: u32 = 550;
+
     let mut is_active_array = [false; 24];
     let mut last_played_info: Option<(String, i8, i32)> = None;
 
     loop {
         let pedal_held = pedal_atomic.load(Ordering::Relaxed);
-        terminal.draw(|f| draw_ui(f, &is_active_array, &last_played_info, pedal_held))?;
+        terminal.draw(|f| draw_ui(f, &is_active_array, &last_played_info, pedal_held, min_sustain_ms))?;
 
         let mut state_changed = false;
 
@@ -438,6 +462,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key_event) = ev {
                 if key_event.code == KeyCode::Esc {
                     break;
+                }
+
+                // Sol ve Sağ Ok: Minimum Uzama Süresini Değiştir
+                if key_event.kind == KeyEventKind::Press || key_event.kind == KeyEventKind::Repeat {
+                    match key_event.code {
+                        KeyCode::Left => {
+                            if min_sustain_ms > 100 {
+                                min_sustain_ms -= 50;
+                                state_changed = true;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if min_sustain_ms < 3000 {
+                                min_sustain_ms += 50;
+                                state_changed = true;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
 
                 // SPACE -> Sustain Pedalı (MIDI Controller #64)
@@ -484,13 +527,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else if key_event.kind == KeyEventKind::Release {
                         received_real_release = true;
                         if let Some(midi_note) = active_midi_notes[slot_idx].take() {
-                            let mut s = synth.lock().unwrap();
-                            s.note_off(0, midi_note);
+                            // Tuş bırakıldığında sesi hemen kesmek yerine, minimum uzama süresini
+                            // tamamlayana kadar bekletilecekler listesine ekliyoruz!
+                            let press_time = last_press_time[slot_idx].unwrap_or_else(Instant::now);
+                            let min_duration = Duration::from_millis(min_sustain_ms as u64);
+                            let elapsed = Instant::now().duration_since(press_time);
+
+                            if elapsed >= min_duration {
+                                let mut s = synth.lock().unwrap();
+                                s.note_off(0, midi_note);
+                            } else {
+                                let release_at = press_time + min_duration;
+                                pending_release_notes.push((midi_note, release_at));
+                            }
+
                             last_press_time[slot_idx] = None;
                             state_changed = true;
                         }
                     }
                 }
+            }
+        }
+
+        // Bekleyen uzama süreleri dolan notaların susturucusunu kapat
+        let now = Instant::now();
+        let mut i = 0;
+        while i < pending_release_notes.len() {
+            if now >= pending_release_notes[i].1 {
+                let (note, _) = pending_release_notes.remove(i);
+                let mut s = synth.lock().unwrap();
+                s.note_off(0, note);
+            } else {
+                i += 1;
             }
         }
 
@@ -510,14 +578,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Tuşlar Fallback Timeout
         if !received_real_release {
             let now = Instant::now();
-            for i in 0..24 {
-                if let Some(last_time) = last_press_time[i] {
+            for idx in 0..24 {
+                if let Some(last_time) = last_press_time[idx] {
                     if now.duration_since(last_time) > fallback_release_timeout {
-                        if let Some(midi_note) = active_midi_notes[i].take() {
-                            let mut s = synth.lock().unwrap();
-                            s.note_off(0, midi_note);
+                        if let Some(midi_note) = active_midi_notes[idx].take() {
+                            let min_duration = Duration::from_millis(min_sustain_ms as u64);
+                            let elapsed = now.duration_since(last_time);
+                            if elapsed >= min_duration {
+                                let mut s = synth.lock().unwrap();
+                                s.note_off(0, midi_note);
+                            } else {
+                                pending_release_notes.push((midi_note, last_time + min_duration));
+                            }
                         }
-                        last_press_time[i] = None;
+                        last_press_time[idx] = None;
                         state_changed = true;
                     }
                 }
@@ -525,8 +599,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if state_changed {
-            for i in 0..24 {
-                is_active_array[i] = active_midi_notes[i].is_some();
+            for idx in 0..24 {
+                is_active_array[idx] = active_midi_notes[idx].is_some();
             }
         }
     }
