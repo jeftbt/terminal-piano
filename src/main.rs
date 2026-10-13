@@ -135,6 +135,7 @@ struct PianoApp {
     pedal_pressed: bool,
     min_sustain_ms: u32,
     velocity: i32,
+    base_octave: i8, // Varsayılan 3 (yani 3 ve 4). Tab ile 1, 2, 3, 4, 5 arasında döner.
 
     last_played_info: Option<(String, i8, i32)>,
     mouse_active_slot: Option<usize>,
@@ -166,6 +167,7 @@ impl PianoApp {
             pedal_pressed: false,
             min_sustain_ms: 550,
             velocity: 95,
+            base_octave: 3,
             last_played_info: None,
             mouse_active_slot: None,
         }
@@ -214,8 +216,8 @@ impl PianoApp {
     }
 
     fn draw_continuous_piano(&mut self, ui: &mut egui::Ui, shift_pressed: bool, alt_pressed: bool) {
-        let bass_octave = if alt_pressed { 1 } else if shift_pressed { 2 } else { 3 };
-        let treble_octave = if alt_pressed { 6 } else if shift_pressed { 5 } else { 4 };
+        let bass_octave = (self.base_octave + if alt_pressed { -2 } else if shift_pressed { -1 } else { 0 }).clamp(0, 8);
+        let treble_octave = (self.base_octave + 1 + if alt_pressed { 2 } else if shift_pressed { 1 } else { 0 }).clamp(0, 8);
 
         let available_width = ui.available_width().max(800.0);
         let total_white_keys = 14.0;
@@ -550,15 +552,25 @@ impl eframe::App for PianoApp {
             s.process_midi_message(0, 0xB0, 64, if space_down { 127 } else { 0 });
         }
 
+        // TAB: Piyano Temel Oktavını Değiştir (Döngüsel: 1..=5)
+        if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            // 1, 2, 3, 4, 5 arasında döngü
+            self.base_octave = if self.base_octave >= 5 {
+                1
+            } else {
+                self.base_octave + 1
+            };
+        }
+
         // Kromatik 24 Tuş Kontrolü
         for (slot_idx, slot) in SLOTS.iter().enumerate() {
             let is_down = ctx.input(|i| i.key_down(slot.key_code));
             let was_down = self.active_midi_notes[slot_idx].is_some();
 
             let octave = if slot_idx >= 12 {
-                if alt_pressed { 6 } else if shift_pressed { 5 } else { 4 }
+                (self.base_octave + 1 + if alt_pressed { 2 } else if shift_pressed { 1 } else { 0 }).clamp(0, 8)
             } else {
-                if alt_pressed { 1 } else if shift_pressed { 2 } else { 3 }
+                (self.base_octave + if alt_pressed { -2 } else if shift_pressed { -1 } else { 0 }).clamp(0, 8)
             };
 
             if is_down && !was_down {
@@ -602,6 +614,19 @@ impl eframe::App for PianoApp {
                     .inner_margin(egui::Margin::symmetric(10, 4));
                 pill.show(ui, |ui| {
                     ui.label(egui::RichText::new(pedal_txt).size(11.0).strong().color(pedal_fg));
+                });
+
+                ui.add_space(4.0);
+
+                // Oktav Rozeti (Tab ile geçiş)
+                let oct_pill = egui::Frame::new()
+                    .fill(Color32::from_rgb(32, 34, 40))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 58, 70)))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 4));
+                oct_pill.show(ui, |ui| {
+                    let text = format!("OKTAV: {} & {} [TAB]", self.base_octave, self.base_octave + 1);
+                    ui.label(egui::RichText::new(text).size(11.0).strong().color(Color32::from_rgb(215, 220, 235)));
                 });
             });
         });
@@ -657,7 +682,7 @@ impl eframe::App for PianoApp {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("Bas Bölge: [Z..M]  │  Tiz Bölge: [Q..U]  │  Oktav: Shift (+1) / Alt (+2)  │  Pedal: Space  │  Fare: Tıkla / Sürükle (Glissando)")
+                egui::RichText::new("Oktav Değiştir: [TAB]  │  Bas Bölge: [Z..M]  │  Tiz Bölge: [Q..U]  │  Shift (+1) / Alt (+2)  │  Pedal: [Space]  │  Tuşe: [↑/↓]")
                     .size(11.5)
                     .color(Color32::from_rgb(110, 115, 125)),
             );
