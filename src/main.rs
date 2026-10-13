@@ -204,7 +204,7 @@ fn velocity_label(vel: i32) -> &'static str {
     }
 }
 
-/// Gerçek akustik piyano düzeninde (siyah tuşlar üstte, beyazlar altta) oktav çizimi
+/// Gerçek akustik piyano düzeninde (iç içe geçmiş siyah ve beyaz tuşlar) oktav çizimi
 fn render_realistic_piano_octave(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -212,102 +212,183 @@ fn render_realistic_piano_octave(
     slots: &[KeySlot],
     active: &[bool],
 ) {
-    let block = Block::default()
+    // 72 genişliğe sabitleyip yatayda ortala
+    let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    
+    let key_width: u16 = 72;
+    let target_rect = if area.width > key_width {
+        let left_pad = (area.width - key_width) / 2;
+        Rect {
+            x: area.x + left_pad,
+            y: area.y,
+            width: key_width,
+            height: area.height,
+        }
+    } else {
+        area
+    };
 
-    // 2 katman: Üst katman (siyah tuşlar için), Alt katman (beyaz tuşlar için)
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3)])
-        .split(inner);
+    let inner = outer_block.inner(target_rect);
+    f.render_widget(outer_block, target_rect);
 
-    // 7 Beyaz Tuş Sütunları
-    let white_indices = [0, 2, 4, 5, 7, 9, 11]; // C, D, E, F, G, A, B
-    let white_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, 7); 7])
-        .split(rows[1]);
-
-    for (w_pos, &slot_idx) in white_indices.iter().enumerate() {
-        let is_active = active[slot_idx];
-        let slot = slots[slot_idx];
-        let note_name = NOTE_NAMES[slot.semitone as usize];
-
-        let (border_col, bg_col, fg_col) = if is_active {
-            (Color::Green, Color::Green, Color::Black)
-        } else {
-            (Color::White, Color::Reset, Color::White)
-        };
-
-        let key_lines = vec![
-            Line::from(Span::styled(
-                format!("{} [{}]", note_name, slot.key_label),
-                Style::default().fg(fg_col).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(if is_active { "██████" } else { "░░░░░░" }),
-        ];
-
-        let p = Paragraph::new(key_lines)
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(bg_col))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border_col)),
-            );
-        f.render_widget(p, white_cols[w_pos]);
+    if inner.height < 7 || inner.width < 70 {
+        return;
     }
 
-    // Üst Katman: Siyah tuşların boşluklu yerleşimi (7 yuva: C#, D#, boş, F#, G#, A#, boş)
-    let black_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, 7); 7])
-        .split(rows[0]);
+    // Renk Tanımları: Gerçek Fildişi ve Abanoz piyano tuşları
+    let white_bg = Color::Rgb(242, 242, 242);
+    let white_fg = Color::Rgb(20, 20, 20);
+    let black_bg = Color::Rgb(28, 28, 32);
+    let black_fg = Color::Rgb(245, 245, 245);
+    let active_bg = Color::Rgb(46, 204, 113); // Canlı Yeşil
+    let active_fg = Color::Black;
+    let slit_color = Color::Rgb(160, 160, 160);
 
-    // (slot_index, yuva_konumu)
-    let black_mappings = [
-        (1, 0),  // C# -> C üzerinde
-        (3, 1),  // D# -> D üzerinde
-        (6, 3),  // F# -> F üzerinde
-        (8, 4),  // G# -> G üzerinde
-        (10, 5), // A# -> A üzerinde
+    let get_w_style = |idx: usize| -> Style {
+        if active[idx] {
+            Style::default().bg(active_bg).fg(active_fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(white_bg).fg(white_fg)
+        }
+    };
+
+    let get_b_style = |idx: usize| -> Style {
+        if active[idx] {
+            Style::default().bg(active_bg).fg(active_fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(black_bg).fg(black_fg).add_modifier(Modifier::BOLD)
+        }
+    };
+
+    let slit_style = Style::default().bg(white_bg).fg(slit_color);
+
+    let mut lines = Vec::new();
+
+    // Üst Bölge (Satır 0..3: Siyah tuşlar ve beyaz tuşların üst boğazı)
+    for row in 0..3 {
+        let mut spans = Vec::new();
+        // C (0)
+        spans.push(Span::styled("       ", get_w_style(0)));
+        // C# (1)
+        let c_sharp_txt = if row == 1 {
+            format!("  {:<4}", NOTE_NAMES[slots[1].semitone as usize])
+        } else if row == 2 {
+            format!(" [{}]  ", slots[1].key_label)
+        } else {
+            "      ".to_string()
+        };
+        spans.push(Span::styled(c_sharp_txt, get_b_style(1)));
+        // D (2)
+        spans.push(Span::styled("    ", get_w_style(2)));
+        // D# (3)
+        let d_sharp_txt = if row == 1 {
+            format!("  {:<4}", NOTE_NAMES[slots[3].semitone as usize])
+        } else if row == 2 {
+            format!(" [{}]  ", slots[3].key_label)
+        } else {
+            "      ".to_string()
+        };
+        spans.push(Span::styled(d_sharp_txt, get_b_style(3)));
+        // E (4) + E/F ayrımı
+        spans.push(Span::styled("      ", get_w_style(4)));
+        spans.push(Span::styled("│", slit_style));
+        // F (5)
+        spans.push(Span::styled("       ", get_w_style(5)));
+        // F# (6)
+        let f_sharp_txt = if row == 1 {
+            format!("  {:<4}", NOTE_NAMES[slots[6].semitone as usize])
+        } else if row == 2 {
+            format!(" [{}]  ", slots[6].key_label)
+        } else {
+            "      ".to_string()
+        };
+        spans.push(Span::styled(f_sharp_txt, get_b_style(6)));
+        // G (7)
+        spans.push(Span::styled("    ", get_w_style(7)));
+        // G# (8)
+        let g_sharp_txt = if row == 1 {
+            format!("  {:<4}", NOTE_NAMES[slots[8].semitone as usize])
+        } else if row == 2 {
+            format!(" [{}]  ", slots[8].key_label)
+        } else {
+            "      ".to_string()
+        };
+        spans.push(Span::styled(g_sharp_txt, get_b_style(8)));
+        // A (9)
+        spans.push(Span::styled("    ", get_w_style(9)));
+        // A# (10)
+        let a_sharp_txt = if row == 1 {
+            format!("  {:<4}", NOTE_NAMES[slots[10].semitone as usize])
+        } else if row == 2 {
+            format!(" [{}]  ", slots[10].key_label)
+        } else {
+            "      ".to_string()
+        };
+        spans.push(Span::styled(a_sharp_txt, get_b_style(10)));
+        // B (11)
+        spans.push(Span::styled("       ", get_w_style(11)));
+
+        lines.push(Line::from(spans));
+    }
+
+    // Geçiş Satırı: Siyah tuşların alt sınır rafı (3D gölge/çerçeve)
+    {
+        let mut spans = Vec::new();
+        spans.push(Span::styled("       ", get_w_style(0)));
+        spans.push(Span::styled("▀▀▀▀▀▀", Style::default().bg(white_bg).fg(black_bg)));
+        spans.push(Span::styled("    ", get_w_style(2)));
+        spans.push(Span::styled("▀▀▀▀▀▀", Style::default().bg(white_bg).fg(black_bg)));
+        spans.push(Span::styled("      ", get_w_style(4)));
+        spans.push(Span::styled("│", slit_style));
+        spans.push(Span::styled("       ", get_w_style(5)));
+        spans.push(Span::styled("▀▀▀▀▀▀", Style::default().bg(white_bg).fg(black_bg)));
+        spans.push(Span::styled("    ", get_w_style(7)));
+        spans.push(Span::styled("▀▀▀▀▀▀", Style::default().bg(white_bg).fg(black_bg)));
+        spans.push(Span::styled("    ", get_w_style(9)));
+        spans.push(Span::styled("▀▀▀▀▀▀", Style::default().bg(white_bg).fg(black_bg)));
+        spans.push(Span::styled("       ", get_w_style(11)));
+        lines.push(Line::from(spans));
+    }
+
+    // Alt Bölge (Satır 4..7: Beyaz tuşların geniş gövdesi ve etiketleri)
+    let white_slots = [
+        (0, "C"),
+        (2, "D"),
+        (4, "E"),
+        (5, "F"),
+        (7, "G"),
+        (9, "A"),
+        (11, "B"),
     ];
 
-    for (slot_idx, col_pos) in black_mappings {
-        let is_active = active[slot_idx];
-        let slot = slots[slot_idx];
-        let note_name = NOTE_NAMES[slot.semitone as usize];
+    for row in 0..3 {
+        let mut spans = Vec::new();
+        for (i, &(w_idx, _)) in white_slots.iter().enumerate() {
+            let is_last = i == 6;
+            let body_str = if row == 1 {
+                format!("    {:<5}", NOTE_NAMES[slots[w_idx].semitone as usize])
+            } else if row == 2 {
+                format!("   [{}]   ", slots[w_idx].key_label)
+            } else {
+                "         ".to_string()
+            };
 
-        let (border_col, bg_col, fg_col) = if is_active {
-            (Color::Green, Color::Green, Color::Black)
-        } else {
-            (Color::DarkGray, Color::DarkGray, Color::White)
-        };
+            spans.push(Span::styled(body_str, get_w_style(w_idx)));
 
-        let key_lines = vec![
-            Line::from(Span::styled(
-                format!("{} [{}]", note_name, slot.key_label),
-                Style::default().fg(fg_col).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(if is_active { "██████" } else { "▓▓▓▓▓▓" }),
-        ];
-
-        let p = Paragraph::new(key_lines)
-            .alignment(Alignment::Center)
-            .style(Style::default().bg(bg_col))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border_col)),
-            );
-        f.render_widget(p, black_layout[col_pos]);
+            if !is_last {
+                spans.push(Span::styled("│", slit_style));
+            } else {
+                spans.push(Span::styled(" ", get_w_style(w_idx)));
+            }
+        }
+        lines.push(Line::from(spans));
     }
+
+    let piano_widget = Paragraph::new(lines);
+    f.render_widget(piano_widget, inner);
 }
 
 fn draw_ui(
@@ -323,11 +404,11 @@ fn draw_ui(
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Başlık
-            Constraint::Length(8), // Üst Sıra Piyano (Tizler)
-            Constraint::Length(8), // Alt Sıra Piyano (Baslar)
-            Constraint::Length(3), // Durum Çubuğu
-            Constraint::Length(2), // Kısayollar
+            Constraint::Length(3),  // Başlık
+            Constraint::Length(10), // Üst Sıra Piyano (Tizler)
+            Constraint::Length(10), // Alt Sıra Piyano (Baslar)
+            Constraint::Length(3),  // Durum Çubuğu
+            Constraint::Length(2),  // Kısayollar
         ])
         .margin(1)
         .split(size);
